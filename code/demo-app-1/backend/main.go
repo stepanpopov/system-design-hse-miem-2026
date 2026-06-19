@@ -33,17 +33,67 @@ var (
         []string{"method", "path", "status"},
     )
 
-    dbQueryDuration = prometheus.NewHistogram(
+    dbQueryDuration = prometheus.NewHistogramVec(
         prometheus.HistogramOpts{
             Name:    "db_query_duration_seconds",
-            Help:    "Database query durations",
+            Help:    "Database query durations by operation",
             Buckets: prometheus.DefBuckets,
         },
+        []string{"operation"},
     )
+
+    dbErrors = prometheus.NewCounterVec(
+        prometheus.CounterOpts{
+            Name: "db_errors_total",
+            Help: "Total database errors by operation",
+        },
+        []string{"operation"},
+    )
+
+    requestsInFlight = prometheus.NewGauge(prometheus.GaugeOpts{
+        Name: "http_requests_in_flight",
+        Help: "Current number of in-flight HTTP requests",
+    })
+
+    dbPoolOpen = prometheus.NewGauge(prometheus.GaugeOpts{
+        Name: "db_pool_open_connections",
+        Help: "Number of established connections to the database",
+    })
+    dbPoolInUse = prometheus.NewGauge(prometheus.GaugeOpts{
+        Name: "db_pool_in_use_connections",
+        Help: "Number of connections currently in use",
+    })
+    dbPoolIdle = prometheus.NewGauge(prometheus.GaugeOpts{
+        Name: "db_pool_idle_connections",
+        Help: "Number of idle connections in the pool",
+    })
+    dbPoolWaitCount = prometheus.NewGauge(prometheus.GaugeOpts{
+        Name: "db_pool_wait_count",
+        Help: "Total number of connections waited for (pool saturation)",
+    })
+    dbPoolWaitSeconds = prometheus.NewGauge(prometheus.GaugeOpts{
+        Name: "db_pool_wait_seconds_total",
+        Help: "Total time blocked waiting for a connection, in seconds",
+    })
+    dbPoolMaxOpen = prometheus.NewGauge(prometheus.GaugeOpts{
+        Name: "db_pool_max_open_connections",
+        Help: "Configured max open connections limit (0 = unlimited)",
+    })
 )
 
 func init() {
-    prometheus.MustRegister(requestDuration, requestCount, dbQueryDuration)
+    prometheus.MustRegister(
+        requestDuration, requestCount, dbQueryDuration, dbErrors,
+        requestsInFlight,
+        dbPoolOpen, dbPoolInUse, dbPoolIdle, dbPoolWaitCount, dbPoolWaitSeconds, dbPoolMaxOpen,
+    )
+}
+
+func observeDB(operation string, start time.Time, err error) {
+    dbQueryDuration.WithLabelValues(operation).Observe(time.Since(start).Seconds())
+    if err != nil && err != sql.ErrNoRows {
+        dbErrors.WithLabelValues(operation).Inc()
+    }
 }
 
 type Server struct {
@@ -69,6 +119,30 @@ func main() {
     }
 
     s := &Server{db: db}
+
+    if v := os.Getenv("DB_MAX_OPEN_CONNS"); v != "" {
+        if n, e := strconv.Atoi(v); e == nil {
+            db.SetMaxOpenConns(n)
+        }
+    }
+    if v := os.Getenv("DB_MAX_IDLE_CONNS"); v != "" {
+        if n, e := strconv.Atoi(v); e == nil {
+            db.SetMaxIdleConns(n)
+        }
+    }
+
+    go func() {
+        for {
+            st := db.Stats()
+            dbPoolOpen.Set(float64(st.OpenConnections))
+            dbPoolInUse.Set(float64(st.InUse))
+            dbPoolIdle.Set(float64(st.Idle))
+            dbPoolWaitCount.Set(float64(st.WaitCount))
+            dbPoolWaitSeconds.Set(st.WaitDuration.Seconds())
+            dbPoolMaxOpen.Set(float64(st.MaxOpenConnections))
+            time.Sleep(time.Second)
+        }
+    }()
 
     r := mux.NewRouter()
     api := r.PathPrefix("/api").Subrouter()
@@ -97,6 +171,8 @@ func main() {
 func instrumentHandler(h http.Handler) http.Handler {
     return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
         start := time.Now()
+        requestsInFlight.Inc()
+        defer requestsInFlight.Dec()
         rw := &statusRecorder{ResponseWriter: w, status: 200}
         h.ServeHTTP(rw, r)
         dur := time.Since(start).Seconds()
@@ -139,7 +215,7 @@ func (s *Server) createUser(w http.ResponseWriter, r *http.Request) {
     }
     start := time.Now()
     err := s.db.QueryRow("INSERT INTO users (name, email) VALUES ($1, $2) RETURNING id, created_at", u.Name, u.Email).Scan(&u.ID, &u.CreatedAt)
-    dbQueryDuration.Observe(time.Since(start).Seconds())
+    observeDB("create_user", start, err)
     if err != nil {
         http.Error(w, err.Error(), http.StatusInternalServerError)
         return
@@ -151,7 +227,7 @@ func (s *Server) createUser(w http.ResponseWriter, r *http.Request) {
 func (s *Server) listUsers(w http.ResponseWriter, r *http.Request) {
     start := time.Now()
     rows, err := s.db.Query("SELECT id, name, email, created_at FROM users ORDER BY id DESC LIMIT 100")
-    dbQueryDuration.Observe(time.Since(start).Seconds())
+    observeDB("list_users", start, err)
     if err != nil {
         http.Error(w, err.Error(), http.StatusInternalServerError)
         return
@@ -177,7 +253,7 @@ func (s *Server) getUser(w http.ResponseWriter, r *http.Request) {
     start := time.Now()
     var u User
     err := s.db.QueryRow("SELECT id, name, email, created_at FROM users WHERE id=$1", id).Scan(&u.ID, &u.Name, &u.Email, &u.CreatedAt)
-    dbQueryDuration.Observe(time.Since(start).Seconds())
+    observeDB("get_user", start, err)
     if err != nil {
         if err == sql.ErrNoRows {
             http.Error(w, "not found", http.StatusNotFound)
@@ -201,7 +277,7 @@ func (s *Server) updateUser(w http.ResponseWriter, r *http.Request) {
     }
     start := time.Now()
     _, err := s.db.Exec("UPDATE users SET name=$1, email=$2 WHERE id=$3", u.Name, u.Email, id)
-    dbQueryDuration.Observe(time.Since(start).Seconds())
+    observeDB("update_user", start, err)
     if err != nil {
         http.Error(w, err.Error(), http.StatusInternalServerError)
         return
@@ -215,7 +291,7 @@ func (s *Server) deleteUser(w http.ResponseWriter, r *http.Request) {
     id, _ := strconv.Atoi(idStr)
     start := time.Now()
     _, err := s.db.Exec("DELETE FROM users WHERE id=$1", id)
-    dbQueryDuration.Observe(time.Since(start).Seconds())
+    observeDB("delete_user", start, err)
     if err != nil {
         http.Error(w, err.Error(), http.StatusInternalServerError)
         return
@@ -231,7 +307,7 @@ func (s *Server) createOrder(w http.ResponseWriter, r *http.Request) {
     }
     start := time.Now()
     err := s.db.QueryRow("INSERT INTO orders (user_id, amount, description) VALUES ($1,$2,$3) RETURNING id, created_at", o.UserID, o.Amount, o.Description).Scan(&o.ID, &o.CreatedAt)
-    dbQueryDuration.Observe(time.Since(start).Seconds())
+    observeDB("create_order", start, err)
     if err != nil {
         http.Error(w, err.Error(), http.StatusInternalServerError)
         return
@@ -243,7 +319,7 @@ func (s *Server) createOrder(w http.ResponseWriter, r *http.Request) {
 func (s *Server) listOrders(w http.ResponseWriter, r *http.Request) {
     start := time.Now()
     rows, err := s.db.Query("SELECT id, user_id, amount, description, created_at FROM orders ORDER BY id DESC LIMIT 100")
-    dbQueryDuration.Observe(time.Since(start).Seconds())
+    observeDB("list_orders", start, err)
     if err != nil {
         http.Error(w, err.Error(), http.StatusInternalServerError)
         return
@@ -269,7 +345,7 @@ func (s *Server) getOrder(w http.ResponseWriter, r *http.Request) {
     start := time.Now()
     var o Order
     err := s.db.QueryRow("SELECT id, user_id, amount, description, created_at FROM orders WHERE id=$1", id).Scan(&o.ID, &o.UserID, &o.Amount, &o.Description, &o.CreatedAt)
-    dbQueryDuration.Observe(time.Since(start).Seconds())
+    observeDB("get_order", start, err)
     if err != nil {
         if err == sql.ErrNoRows {
             http.Error(w, "not found", http.StatusNotFound)
@@ -293,7 +369,7 @@ func (s *Server) updateOrder(w http.ResponseWriter, r *http.Request) {
     }
     start := time.Now()
     _, err := s.db.Exec("UPDATE orders SET user_id=$1, amount=$2, description=$3 WHERE id=$4", o.UserID, o.Amount, o.Description, id)
-    dbQueryDuration.Observe(time.Since(start).Seconds())
+    observeDB("update_order", start, err)
     if err != nil {
         http.Error(w, err.Error(), http.StatusInternalServerError)
         return
@@ -307,7 +383,7 @@ func (s *Server) deleteOrder(w http.ResponseWriter, r *http.Request) {
     id, _ := strconv.Atoi(idStr)
     start := time.Now()
     _, err := s.db.Exec("DELETE FROM orders WHERE id=$1", id)
-    dbQueryDuration.Observe(time.Since(start).Seconds())
+    observeDB("delete_order", start, err)
     if err != nil {
         http.Error(w, err.Error(), http.StatusInternalServerError)
         return
