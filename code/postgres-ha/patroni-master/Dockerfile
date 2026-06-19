@@ -7,7 +7,7 @@ ARG PGDATA=$PGHOME/data
 ARG LC_ALL=C.UTF-8
 ARG LANG=C.UTF-8
 
-FROM postgres:$PG_MAJOR as builder
+FROM docker.io/library/postgres:$PG_MAJOR as builder
 
 ARG PGHOME
 ARG PGDATA

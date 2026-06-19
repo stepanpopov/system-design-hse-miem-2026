@@ -17,6 +17,8 @@ services:
     build: ./backend
     environment:
       DATABASE_URL: postgres://demo:demo@db:5432/demo?sslmode=disable
+      DB_MAX_OPEN_CONNS: "80"
+      DB_MAX_IDLE_CONNS: "40"
     ports:
       - "8081:8081"
     depends_on:
@@ -81,6 +83,11 @@ services:
   
   grafana:
     image: grafana/grafana:9.0.0
+    environment:
+      HTTP_PROXY: ""
+      HTTPS_PROXY: ""
+      ALL_PROXY: ""
+      NO_PROXY: "*"
     ports:
       - "3000:3000"
     volumes:
